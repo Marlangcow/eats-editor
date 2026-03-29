@@ -1,9 +1,11 @@
-import { defineConfig } from 'vite'
+import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
 import axios from 'axios'
 
 // https://vite.dev/config/
-export default defineConfig({
+export default defineConfig(({ mode }) => {
+const env = loadEnv(mode, process.cwd(), '');
+return {
   plugins: [
     react(),
     {
@@ -240,9 +242,89 @@ export default defineConfig({
               return res.end('Proxy Error');
             }
           }
+          // 4. Gemini 이미지 생성 프록시 (API 키 서버에서만 사용)
+          if (req.url?.startsWith('/api/gemini')) {
+            let body = '';
+            req.on('data', chunk => { body += chunk; });
+            req.on('end', async () => {
+              try {
+                const { base64, mimeType } = JSON.parse(body);
+                const geminiApiKey = env.VITE_GEMINI_API_KEY || env.VITE_GOOGLE_API_KEY;
+                if (!geminiApiKey) {
+                  res.statusCode = 500;
+                  return res.end(JSON.stringify({ error: 'VITE_GEMINI_API_KEY가 설정되지 않았습니다.' }));
+                }
+
+                // 사용 가능한 이미지 생성 모델 조회
+                const modelsRes = await axios.get(
+                  `https://generativelanguage.googleapis.com/v1beta/models?key=${geminiApiKey}`
+                );
+                if (modelsRes.data.error) {
+                  res.statusCode = 400;
+                  return res.end(JSON.stringify({ error: modelsRes.data.error.message }));
+                }
+                const models = modelsRes.data.models || [];
+                const imageModel = models.find(m =>
+                  m.supportedGenerationMethods?.includes('generateContent') &&
+                  /imagen|flash.*image|image.*gen/i.test(m.name)
+                );
+                if (!imageModel) {
+                  res.statusCode = 400;
+                  return res.end(JSON.stringify({ error: '이미지 생성 모델을 찾을 수 없습니다.' }));
+                }
+                const modelName = imageModel.name.replace(/^models\//, '');
+                console.log(`[Gemini] 사용 모델: ${modelName}`);
+
+                const PROMPT = `
+                  Task: High-Conversion Food Photography for Coupang Eats
+                  1. Formatting: Exact 1080x660 pixels. Central food framing (80% focus).
+                  2. Aesthetic: Premium 'Elegant Beige' background. Zero environmental noise.
+                  3. Components: Synthesis of an ultra-high-quality ceramic plate. 45-degree angle.
+                  4. Texture: Enhance steam, gloss, and crispness. Professional soft-box lighting.
+                  5. Outpainting: Naturally expand cut-off parts of food/plate to create a full, satisfying view.
+
+                  Guide:
+                  - Appetizing Color: Adjust saturation and brightness slightly to highlight the freshness of raw materials.
+                  - Depth & Shadow: Adding a natural floor shadow so the food doesn't float on the beige background.
+                  - Custom Style: Choose optimized plates and compositions according to menu types (Korean, Western, dessert, etc.).
+                  - 70% Rule: Arrange food to occupy about 70-80% of the screen so that food looks best in the delivery app list.
+                `;
+
+                const gRes = await axios.post(
+                  `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${geminiApiKey}`,
+                  {
+                    contents: [{
+                      parts: [
+                        { text: PROMPT },
+                        { inlineData: { mimeType: mimeType || 'image/png', data: base64 } }
+                      ]
+                    }],
+                    generationConfig: { responseModalities: ['TEXT', 'IMAGE'] }
+                  },
+                  { headers: { 'Content-Type': 'application/json' } }
+                );
+
+                res.setHeader('Content-Type', 'application/json');
+                return res.end(JSON.stringify(gRes.data));
+              } catch (e) {
+                const status = e.response?.status;
+                const apiError = e.response?.data?.error;
+                console.error(`[Gemini] 에러 (HTTP ${status}):`, apiError || e.message);
+                res.statusCode = status || 500;
+                return res.end(JSON.stringify({
+                  error: apiError?.message || e.message,
+                  status: status,
+                  code: apiError?.code || apiError?.status
+                }));
+              }
+            });
+            return;
+          }
+
           next();
         });
       }
     }
   ],
+}
 })

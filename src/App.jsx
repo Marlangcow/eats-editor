@@ -17,7 +17,6 @@ import { getStorage, ref, uploadBytes, getDownloadURL, listAll } from 'firebase/
  */
 let firebaseConfig = null;
 let currentAppId = 'default-app-id';
-let geminiApiKey = "";
 
 const getEnv = (key) => {
   try {
@@ -49,7 +48,6 @@ if (!firebaseConfig) {
     appId: getEnv('VITE_FIREBASE_APP_ID')
   };
   currentAppId = firebaseConfig.projectId || 'default-app-id';
-  geminiApiKey = getEnv('VITE_GOOGLE_API_KEY') || getEnv('VITE_GEMINI_API_KEY') || "";
 }
 
 // Firebase 초기화
@@ -327,72 +325,41 @@ const App = () => {
   const processImage = async (id) => {
     const target = images.find(img => img.id === id);
     if (!target || !target.base64) return;
-    if (!geminiApiKey) {
-      addToast('Gemini API 키가 설정되지 않았습니다.', 'error');
-      return;
-    }
+
     updateImageStatus(id, { status: 'processing' });
     try {
-      // gemini-2.5-flash-image는 상대적으로 더 높은 한도를 제공하는 것으로 알려진 모델입니다.
-      const MODEL_NAME = "gemini-2.5-flash-image";
-      const PROMPT = `
-        Task: High-Conversion Food Photography for Coupang Eats
-        1. Formatting: Exact 1080x660 pixels. Central food framing (80% focus).
-        2. Aesthetic: Premium 'Elegant Beige' background. Zero environmental noise.
-        3. Components: Synthesis of an ultra-high-quality ceramic plate. 45-degree angle.
-        4. Texture: Enhance steam, gloss, and crispness. Professional soft-box lighting.
-        5. Outpainting: Naturally expand cut-off parts of food/plate to create a full, satisfying view.
-
-        Guide:
-        - Appetizing Color: Adjust saturation and brightness slightly to highlight the freshness of raw materials.
-        - Depth & Shadow: Adding a natural floor shadow so the food doesn't float on the beige background.
-        - Custom Style: Choose optimized plates and compositions according to menu types (Korean, Western, dessert, etc.).
-        - 70% Rule: Arrange food to occupy about 70-80% of the screen so that food looks best in the delivery app list.
-        `;
-
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${geminiApiKey}`, {
+      const response = await fetch('/api/gemini', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          contents: [{
-            parts: [
-              { text: PROMPT },
-              { inlineData: { mimeType: "image/png", data: target.base64 } }
-            ]
-          }],
-          generationConfig: {
-            responseModalities: ["TEXT", "IMAGE"]
-          }
-        })
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ base64: target.base64, mimeType: 'image/png' })
       });
 
       const result = await response.json();
-      console.log("Gemini API Response:", result);
-
-      if (response.status === 429 || (result.error && result.error.message?.includes("Quota"))) {
-        throw new Error("AI 보정 할당량이 초과되었습니다. 프리 티어의 경우 하루 요청 횟수가 제한될 수 있습니다. 잠시 후 다시 시도하거나 플랜을 확인해 주세요.");
-      }
 
       if (result.error) {
-        throw new Error(result.error.message || "API Error");
+        const msg = result.error;
+        const status = result.status;
+        const code = result.code;
+        console.error('[Gemini 에러]', { status, code, msg });
+
+        if (status === 403 || code === 'PERMISSION_DENIED' || msg.includes('leaked') || msg.includes('API key'))
+          throw new Error(`API 키 오류: ${msg} → Google AI Studio에서 새 키를 발급해 주세요.`);
+        if (status === 429 || code === 'RESOURCE_EXHAUSTED' || msg.toLowerCase().includes('quota') || msg.toLowerCase().includes('exhausted'))
+          throw new Error('할당량이 초과되었습니다. 잠시 후 다시 시도해 주세요.');
+        throw new Error(msg);
       }
 
       const parts = result.candidates?.[0]?.content?.parts;
       const b64Part = parts?.find(p => p.inlineData);
 
-      if (b64Part && b64Part.inlineData?.data) {
+      if (b64Part?.inlineData?.data) {
         updateImageStatus(id, {
           status: 'success',
           result: `data:image/png;base64,${b64Part.inlineData.data}`
         });
       } else {
-        // 이미지가 아닌 텍스트만 온 경우 (보정 실패 설명 등)
-        const textParts = parts?.filter(p => p.text);
-        const explanation = textParts?.map(p => p.text).join(' ');
-        console.warn("No image in response. Text received:", explanation);
-
+        const explanation = parts?.filter(p => p.text).map(p => p.text).join(' ');
+        console.warn("No image in response:", explanation);
         if (explanation?.includes("Safety") || explanation?.includes("policy")) {
           throw new Error("해당 이미지는 AI 안전 정책에 의해 보정이 제한되었습니다. 다른 사진으로 시도해 주세요.");
         }
@@ -400,11 +367,7 @@ const App = () => {
       }
     } catch (e) {
       console.error("AI correction error:", e);
-      // 할당량 에러 등 특정 키워드가 포함된 경우 더 친절하게 안내
-      let msg = e.message || '보정 중 오류가 발생했습니다.';
-      if (msg.includes("Quota")) msg = "AI 보정 할당량이 초과되었습니다. 잠시 후 다시 시도해 주세요.";
-
-      addToast(msg, 'error');
+      addToast(e.message || '보정 중 오류가 발생했습니다.', 'error');
       updateImageStatus(id, { status: 'error' });
     }
   };
