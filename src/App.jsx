@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import {
   Upload, Download, RefreshCw, Wand2, CheckCircle2,
   X, Layers, ShoppingBag, Rocket, Sparkles, Search,
-  Settings, ImagePlus, Database, ShieldCheck, Link, AlertCircle, Info, ExternalLink
+  Settings, ImagePlus, Database, ShieldCheck, Link, AlertCircle, Info, ExternalLink, PlusCircle
 } from 'lucide-react';
 
 // Firebase 연동
@@ -95,6 +95,18 @@ const App = () => {
   const retoucherInputRef = useRef(null);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadComplete, setUploadComplete] = useState(false);
+
+  const pendingWorkspaceCount = useRef(0);
+  const workspaceToastTimer = useRef(null);
+  const showWorkspaceToast = () => {
+    pendingWorkspaceCount.current += 1;
+    clearTimeout(workspaceToastTimer.current);
+    workspaceToastTimer.current = setTimeout(() => {
+      addToast(`작업 공간에 ${pendingWorkspaceCount.current}개가 추가됨`, 'success');
+      pendingWorkspaceCount.current = 0;
+    }, 300);
+  };
 
   const [images, setImages] = useState([]);
   const [isProcessingAll, setIsProcessingAll] = useState(false);
@@ -153,21 +165,16 @@ const App = () => {
     return () => unsubscribe();
   }, [user]);
 
-  // 3. 검색 기능
+  // 3. 검색 기능 — 파일명에 검색어가 포함된 이미지만 노출
   useEffect(() => {
     if (searchQuery.trim() === '') {
       setRecommendedImages([]);
       return;
     }
     const normalizedQuery = searchQuery.trim().toLowerCase().normalize('NFC');
-    const filtered = library.filter(item => {
-      const normalizedName = (item.name || '').toLowerCase().normalize('NFC');
-      const matchesName = normalizedName.includes(normalizedQuery);
-      const matchesTag = item.tags && item.tags.some(tag =>
-        tag.toLowerCase().normalize('NFC').includes(normalizedQuery)
-      );
-      return matchesName || matchesTag;
-    });
+    const filtered = library.filter(item =>
+      (item.name || '').toLowerCase().normalize('NFC').includes(normalizedQuery)
+    );
     setRecommendedImages(filtered);
   }, [searchQuery, library]);
 
@@ -175,10 +182,24 @@ const App = () => {
     if (!naverUrl) { addToast('주소를 입력해 주세요.', 'error'); return; }
     setIsScraping(true);
     setScrapeStep('데이터 추출 중...');
+    setImages([]);
     try {
       const response = await fetch(`/api/scrape?url=${encodeURIComponent(naverUrl)}`);
       const data = await response.json();
-      if (data.images && data.images.length > 0) {
+
+      if (data.menuItems && data.menuItems.length > 0) {
+        data.menuItems.forEach(item => {
+          if (!item.imageUrl) return;
+          const proxiedUrl = item.imageUrl.includes('pstatic.net')
+            ? `/api/proxy-image?url=${encodeURIComponent(item.imageUrl)}`
+            : item.imageUrl;
+          addToOwnerWorkspace(item.name || '[네이버] 메뉴', proxiedUrl, false, {
+            description: item.description,
+            price: item.price
+          });
+        });
+        addToast(`${data.menuItems.length}개의 메뉴를 가져왔습니다.`, 'success');
+      } else if (data.images && data.images.length > 0) {
         data.images.forEach((url, i) => {
           const proxiedUrl = url.includes('pstatic.net') ? `/api/proxy-image?url=${encodeURIComponent(url)}` : url;
           addToOwnerWorkspace(`[네이버] 메뉴 ${i + 1}`, proxiedUrl);
@@ -203,53 +224,65 @@ const App = () => {
     if (files.length === 0) return;
 
     setIsUploading(true);
+    setUploadComplete(false);
     let completedCount = 0;
 
-    const uploadTasks = files.map(async (file) => {
-      try {
-        const path = `artifacts/${currentAppId}/public/data/dummy_images/${Date.now()}_${file.name}`;
-        const sRef = ref(storage, path);
-        await uploadBytes(sRef, file);
-        const url = await getDownloadURL(sRef);
-        const cleanName = file.name.split('.')[0].normalize('NFC');
-        await addDoc(collection(db, 'artifacts', currentAppId, 'public', 'data', 'dummy_images'), {
-          name: cleanName,
-          tags: [cleanName],
-          url,
-          createdAt: new Date().toISOString()
-        });
-        completedCount++;
-        setUploadProgress(Math.round((completedCount / files.length) * 100));
-      } catch (err) {
-        console.error("Upload error for file:", file.name, err);
-      }
-    });
+    try {
+      const uploadTasks = files.map(async (file) => {
+        try {
+          const filePath = `artifacts/${currentAppId}/public/data/dummy_images/${Date.now()}_${file.name}`;
+          const sRef = ref(storage, filePath);
+          await uploadBytes(sRef, file);
+          const url = await getDownloadURL(sRef);
+          const cleanName = file.name.split('.')[0].normalize('NFC');
+          await addDoc(collection(db, 'artifacts', currentAppId, 'public', 'data', 'dummy_images'), {
+            name: cleanName,
+            tags: [cleanName],
+            url,
+            createdAt: new Date().toISOString()
+          });
+          completedCount++;
+          setUploadProgress(Math.round((completedCount / files.length) * 100));
+        } catch (err) {
+          console.error("Upload error for file:", file.name, err);
+          addToast(`${file.name} 업로드 실패`, 'error');
+        }
+      });
 
-    await Promise.all(uploadTasks);
-    // 100% 상태를 잠깐 보여주기 위한 처리
-    setUploadProgress(100);
-    setTimeout(() => {
+      await Promise.all(uploadTasks);
+    } finally {
       setIsUploading(false);
       setUploadProgress(0);
-      if (completedCount > 0) addToast(`${completedCount}장 업로드 완료`, 'success');
-    }, 500);
+      if (completedCount > 0) {
+        setUploadComplete(true);
+        addToast(`${completedCount}장 업로드 완료`, 'success');
+        setTimeout(() => setUploadComplete(false), 3000);
+      }
+    }
   };
 
-  const addToOwnerWorkspace = (name, url, isBase64 = false) => {
+  const addToOwnerWorkspace = (name, url, isBase64 = false, meta = {}) => {
     const id = crypto.randomUUID();
-    const newItem = { id, name, sourceUrl: url, status: 'idle' };
+    const newItem = { id, name, sourceUrl: url, status: 'idle', description: meta.description || '', price: meta.price || '' };
     if (isBase64) {
       newItem.base64 = url.split(',')[1];
       setImages(prev => [newItem, ...prev]);
     } else {
+      // 먼저 작업 공간에 추가하고, base64는 비동기로 채움
+      setImages(prev => [newItem, ...prev]);
       fetch(url).then(r => r.blob()).then(b => {
         const reader = new FileReader();
         reader.onloadend = () => {
-          newItem.base64 = reader.result.split(',')[1];
-          setImages(prev => [newItem, ...prev]);
+          setImages(prev => prev.map(img =>
+            img.id === id ? { ...img, base64: reader.result.split(',')[1] } : img
+          ));
+          showWorkspaceToast();
         };
         reader.readAsDataURL(b);
-      }).catch(() => addToast('이미지를 불러올 수 없습니다.', 'error'));
+      }).catch(() => {
+        setImages(prev => prev.filter(img => img.id !== id));
+        addToast('이미지를 불러올 수 없습니다.', 'error');
+      });
     }
   };
 
@@ -265,7 +298,6 @@ const App = () => {
   const selectFromLibrary = (item) => {
     addToOwnerWorkspace(item.name, item.url);
     setSearchQuery('');
-    addToast('작업 공간에 추가됨', 'success');
   };
 
   const processImage = async (id) => {
@@ -484,10 +516,19 @@ const App = () => {
               <button
                 onClick={() => retoucherInputRef.current?.click()}
                 disabled={isUploading}
-                className={`px-10 py-5 rounded-[1.5rem] font-black flex items-center gap-3 mx-auto transition-all shadow-xl active:scale-95 ${isUploading ? 'bg-slate-100 text-slate-400 cursor-not-allowed' : 'bg-slate-900 text-white hover:bg-black hover:scale-105'
-                  }`}
+                className={`px-10 py-5 rounded-[1.5rem] font-black flex items-center gap-3 mx-auto transition-all shadow-xl active:scale-95 ${
+                  isUploading ? 'bg-slate-100 text-slate-400 cursor-not-allowed' :
+                  uploadComplete ? 'bg-[#03C75A] text-white scale-105' :
+                  'bg-slate-900 text-white hover:bg-black hover:scale-105'
+                }`}
               >
-                {isUploading ? <><RefreshCw className="animate-spin" size={24} /> 업로드 중...</> : <><ImagePlus size={24} /> 사진 묶음 등록하기</>}
+                {isUploading ? (
+                  <><RefreshCw className="animate-spin" size={24} /> 업로드 중...</>
+                ) : uploadComplete ? (
+                  <><CheckCircle2 size={24} /> 업로드 완료!</>
+                ) : (
+                  <><ImagePlus size={24} /> 사진 묶음 등록하기</>
+                )}
               </button>
             </div>
 
@@ -562,7 +603,7 @@ const App = () => {
                       </button>
                     ))}
                     {searchQuery && recommendedImages.length === 0 && (
-                      <p className="col-span-2 py-8 text-center text-slate-400 text-xs font-bold">검색 결과가 없어요.</p>
+                      <p className="col-span-2 py-8 text-center text-slate-400 text-xs font-bold">라이브러리에 등록된 사진이 없어요.</p>
                     )}
                   </div>
                 </section>
@@ -642,10 +683,14 @@ const App = () => {
                         </button>
                       </div>
 
-                      <div className="p-5 bg-white border-t border-slate-100 flex items-center">
-                        <div className="flex-1">
+                      <div className="p-5 bg-white border-t border-slate-100 flex items-center gap-3">
+                        <div className="flex-1 min-w-0">
                           <p className="text-[13px] font-black text-slate-800 truncate leading-none mb-1">{img.name}</p>
-                          <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Premium Upscale</p>
+                          {img.description && <p className="text-[11px] text-slate-400 truncate mb-0.5">{img.description}</p>}
+                          {img.price
+                            ? <p className="text-[12px] font-black text-[#00AEEF]">{img.price}</p>
+                            : <p className="text-[10px] font-bold text-slate-300 uppercase tracking-widest">Premium Upscale</p>
+                          }
                         </div>
                       </div>
                     </div>
