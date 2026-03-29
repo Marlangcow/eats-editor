@@ -23,38 +23,158 @@ export default defineConfig({
 
               console.log(`\n[Scrape] placeId: ${placeId}`);
 
-              // 공통 헤더
-              const naverHeaders = {
+              const desktopHeaders = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
                 'Accept-Language': 'ko-KR,ko;q=0.9',
-                'Referer': `https://pcmap.place.naver.com/restaurant/${placeId}/menu/list`,
-                'Origin': 'https://pcmap.place.naver.com',
+                'Referer': `https://map.naver.com/`,
+              };
+              const mobileHeaders = {
+                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+                'Accept-Language': 'ko-KR,ko;q=0.9',
+                'Referer': `https://m.place.naver.com/restaurant/${placeId}/menu/list`,
               };
 
               let menuItems = [];
 
-              // 2. Naver Place 공개 JSON API 시도
-              try {
-                const apiRes = await axios.get(
-                  `https://map.naver.com/p/api/place/restaurant/${placeId}`,
-                  { headers: naverHeaders }
-                );
-                console.log('[API] status:', apiRes.status, '| keys:', Object.keys(apiRes.data || {}));
-                const menus = apiRes.data?.menuList || apiRes.data?.menus || apiRes.data?.result?.menuList;
-                if (menus?.length) {
-                  menuItems = menus.map(m => ({
-                    name: m.name || m.menuName || '',
-                    description: m.description || m.desc || '',
-                    price: m.price != null ? String(m.price) : '',
-                    imageUrl: m.images?.[0]?.url || m.imageUrl || m.photo || ''
-                  }));
-                  console.log(`[API] 메뉴 ${menuItems.length}개 추출`);
+              // 메뉴 아이템 객체에서 이미지 URL 추출 (다양한 필드명 대응)
+              const extractImageUrl = (m) =>
+                m.images?.[0]?.url || m.image?.[0]?.url ||
+                m.representativeImages?.[0]?.url || m.thumbnailImages?.[0]?.url ||
+                m.imageUrl || m.photo || m.thumbnailUrl || m.imgUrl || '';
+
+              // 메뉴 아이템 배열인지 판별 — name + (price or description) 있으면 메뉴로 간주
+              const isMenuArray = (arr) =>
+                arr.length > 0 && arr[0]?.name != null &&
+                (arr[0]?.price != null || arr[0]?.description != null || arr[0]?.desc != null);
+
+              const toMenuItem = (m) => ({
+                name: m.name || m.menuName || '',
+                description: m.description || m.desc || m.content || '',
+                price: m.price != null ? String(m.price) : '',
+                imageUrl: extractImageUrl(m)
+              });
+
+              // __NEXT_DATA__ 재귀 탐색
+              const findMenusInJson = (obj, depth = 0) => {
+                if (!obj || typeof obj !== 'object' || depth > 20) return null;
+                if (Array.isArray(obj)) {
+                  if (isMenuArray(obj)) return obj.map(toMenuItem);
+                  for (const el of obj) { const r = findMenusInJson(el, depth+1); if (r) return r; }
+                  return null;
                 }
-              } catch (e) {
-                console.warn('[API] 실패:', e.message);
+                for (const key of Object.keys(obj)) {
+                  if (/menu/i.test(key) && Array.isArray(obj[key]) && isMenuArray(obj[key])) {
+                    console.log(`[JSON] key="${key}" ${obj[key].length}개, sample:`, JSON.stringify(obj[key][0]).slice(0, 150));
+                    return obj[key].map(toMenuItem);
+                  }
+                  const r = findMenusInJson(obj[key], depth+1);
+                  if (r) return r;
+                }
+                return null;
+              };
+
+              // pstatic 이미지 URL 정규화
+              const normImg = (u) => u.replace(/\\u002F/g, '/').replace(/\\u0026/g, '&');
+              const isMenuImg = (u) => !u.includes('f30_30') && !u.includes('ico');
+
+              // HTML에서 메뉴 추출:
+              // 1) HZmgf 컨테이너 단위 (이름+설명+가격+이미지 개별 매핑)
+              // 2) 컨테이너 없으면 lPzHi 위치 기준으로 근접 이미지 매핑
+              const extractFromHtml = (html, label) => {
+                let processHtml = html;
+                const boardMatch = html.match(/메뉴판 이미지로 보기/);
+                if (boardMatch) processHtml = html.slice(0, boardMatch.index);
+
+                // 방법 1: HZmgf 컨테이너 단위 파싱
+                const chunks = processHtml.split(/class="[^"]*HZmgf[^"]*"/);
+                chunks.shift();
+                if (chunks.length > 0) {
+                  const items = chunks.map(chunk => {
+                    const name  = (chunk.match(/class="lPzHi"[^>]*>([^<]+)</) || [])[1]?.trim() || '';
+                    const desc  = (chunk.match(/class="okI98"[^>]*>([^<]+)</) || [])[1]?.trim() || '';
+                    const price = (chunk.match(/class="p2H02"[^>]*>([^<]+)</) || [])[1]?.trim() || '';
+                    const imgM  = chunk.match(/(?:src|data-src)="(https?:\/\/[^"]*pstatic\.net[^"]*)"/) ||
+                                  chunk.match(/"(https:\\u002F\\u002F[^"]*pstatic[^"\\]+)"/);
+                    const imageUrl = imgM ? normImg(imgM[1]) : '';
+                    return { name, description: desc, price, imageUrl };
+                  }).filter(i => i.name || i.imageUrl);
+
+                  if (items.length > 0) {
+                    console.log(`[${label} HZmgf] ${items.length}개`);
+                    return items;
+                  }
+                }
+
+                // 방법 2: lPzHi 위치 기준으로 주변에서 이미지 탐색
+                const nameMatches = [...processHtml.matchAll(/class="lPzHi"[^>]*>([^<]+)</g)];
+                if (nameMatches.length > 0) {
+                  const allImgMatches = [...processHtml.matchAll(/(?:src|data-src)="(https?:\/\/[^"]*pstatic\.net[^"]*)"/g)]
+                    .filter(m => isMenuImg(m[1]));
+
+                  const items = nameMatches.map((nm, i) => {
+                    const namePos = nm.index;
+                    // 이 이름 이후 가장 가까운 이미지 찾기
+                    const nextImg = allImgMatches.find(im => im.index > namePos);
+                    return {
+                      name: nm[1].trim(),
+                      description: (processHtml.slice(namePos).match(/class="okI98"[^>]*>([^<]+)</) || [])[1]?.trim() || '',
+                      price:       (processHtml.slice(namePos).match(/class="p2H02"[^>]*>([^<]+)</) || [])[1]?.trim() || '',
+                      imageUrl: nextImg ? normImg(nextImg[1]) : ''
+                    };
+                  }).filter(i => i.name || i.imageUrl);
+
+                  console.log(`[${label} 근접매핑] ${items.length}개`);
+                  return items;
+                }
+
+                console.log(`[${label}] 추출 실패`);
+                return [];
+              };
+
+              // 2. 데스크톱 HTML (pcmap — SSR에 lPzHi/okI98 포함)
+              try {
+                const dRes = await axios.get(
+                  `https://pcmap.place.naver.com/restaurant/${placeId}/menu/list`,
+                  { headers: desktopHeaders }
+                );
+                const dHtml = dRes.data;
+                console.log(`[Desktop] HTML 길이: ${dHtml.length}`);
+
+                // __NEXT_DATA__ JSON 우선 시도
+                const ndMatch = dHtml.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+                if (ndMatch) {
+                  const found = findMenusInJson(JSON.parse(ndMatch[1]));
+                  if (found?.length) { menuItems = found; console.log(`[Desktop NEXT_DATA] ${menuItems.length}개`); }
+                }
+
+                // 클래스 직접 추출
+                if (menuItems.length === 0) {
+                  menuItems = extractFromHtml(dHtml, 'Desktop HTML');
+                }
+              } catch (e) { console.warn('[Desktop] 실패:', e.message); }
+
+              // 3. 모바일 HTML fallback
+              if (menuItems.length === 0) {
+                try {
+                  const mRes = await axios.get(
+                    `https://m.place.naver.com/restaurant/${placeId}/menu/list`,
+                    { headers: mobileHeaders }
+                  );
+                  const mHtml = mRes.data;
+                  console.log(`[Mobile] HTML 길이: ${mHtml.length}`);
+
+                  const ndMatch = mHtml.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+                  if (ndMatch) {
+                    const found = findMenusInJson(JSON.parse(ndMatch[1]));
+                    if (found?.length) { menuItems = found; console.log(`[Mobile NEXT_DATA] ${menuItems.length}개`); }
+                  }
+                  if (menuItems.length === 0) {
+                    menuItems = extractFromHtml(mHtml, 'Mobile HTML');
+                  }
+                } catch (e) { console.warn('[Mobile] 실패:', e.message); }
               }
 
-              // 3. GraphQL 시도
+              // 4. GraphQL fallback
               if (menuItems.length === 0) {
                 try {
                   const gqlRes = await axios.post(
@@ -69,95 +189,20 @@ export default defineConfig({
                         }
                       }`
                     }],
-                    { headers: { ...naverHeaders, 'Content-Type': 'application/json' } }
+                    { headers: { ...desktopHeaders, 'Content-Type': 'application/json', 'Origin': 'https://pcmap.place.naver.com' } }
                   );
                   const data = gqlRes.data?.[0]?.data?.restaurant;
-                  console.log('[GQL] restaurant keys:', Object.keys(data || {}));
                   const menus = data?.menuList || data?.menus;
                   if (menus?.length) {
-                    menuItems = menus.map(m => ({
-                      name: m.name || '',
-                      description: m.description || '',
-                      price: m.price != null ? String(m.price) : '',
-                      imageUrl: m.images?.[0]?.url || ''
-                    }));
-                    console.log(`[GQL] 메뉴 ${menuItems.length}개 추출`);
+                    menuItems = menus.map(m => ({ name: m.name||'', description: m.description||'', price: m.price!=null?String(m.price):'', imageUrl: m.images?.[0]?.url||'' }));
+                    console.log(`[GQL] ${menuItems.length}개`);
                   } else {
-                    console.warn('[GQL] 메뉴 없음. 응답:', JSON.stringify(gqlRes.data).slice(0, 300));
+                    console.warn('[GQL] 응답:', JSON.stringify(gqlRes.data).slice(0, 200));
                   }
-                } catch (e) {
-                  console.warn('[GQL] 실패:', e.message);
-                }
+                } catch (e) { console.warn('[GQL] 실패:', e.message); }
               }
 
-              // 4. HTML 파싱 fallback
-              if (menuItems.length === 0) {
-                const pageRes = await axios.get(
-                  `https://pcmap.place.naver.com/restaurant/${placeId}/menu/list`,
-                  { headers: naverHeaders }
-                );
-                const html = pageRes.data;
-                console.log(`[HTML] 길이: ${html.length}`);
-
-                // 4a. __NEXT_DATA__ 재귀 탐색
-                const ndMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-                if (ndMatch) {
-                  try {
-                    const findMenus = (obj, depth = 0) => {
-                      if (!obj || typeof obj !== 'object' || depth > 15) return null;
-                      if (Array.isArray(obj)) {
-                        for (const el of obj) { const r = findMenus(el, depth+1); if (r) return r; }
-                        return null;
-                      }
-                      for (const key of Object.keys(obj)) {
-                        if (['menuList','menus','menuItems'].includes(key) && Array.isArray(obj[key]) && obj[key].length && (obj[key][0]?.name || obj[key][0]?.menuName)) {
-                          console.log(`[NEXT_DATA] "${key}" 발견, ${obj[key].length}개`);
-                          return obj[key].map(m => ({
-                            name: m.name || m.menuName || '',
-                            description: m.description || '',
-                            price: m.price != null ? String(m.price) : '',
-                            imageUrl: m.images?.[0]?.url || m.imageUrl || m.photo || ''
-                          }));
-                        }
-                        const r = findMenus(obj[key], depth+1);
-                        if (r) return r;
-                      }
-                      return null;
-                    };
-                    const found = findMenus(JSON.parse(ndMatch[1]));
-                    if (found?.length) menuItems = found;
-                  } catch(e) { console.warn('[NEXT_DATA] parse error:', e.message); }
-                }
-
-                // 4b. HZmgf 컨테이너 파싱
-                if (menuItems.length === 0) {
-                  // "메뉴판 이미지로 보기" 섹션을 찾아 해당 섹션 이전까지만 사용
-                  let processHtml = html;
-                  const menuBoardMatch = html.match(/class="place_section_header_title"[^>]*>[^<]*메뉴판 이미지로 보기/);
-                  if (menuBoardMatch) {
-                    const sectionStart = html.lastIndexOf('<div', menuBoardMatch.index);
-                    processHtml = sectionStart !== -1 ? html.slice(0, sectionStart) : html;
-                    console.log('[HTML] "메뉴판 이미지로 보기" 섹션 제거 (pos:', sectionStart, ')');
-                  }
-
-                  const chunks = processHtml.split(/class="HZmgf"/);
-                  console.log(`[HTML] HZmgf 컨테이너 수: ${chunks.length - 1}`);
-                  chunks.shift();
-                  menuItems = chunks.map((chunk, i) => {
-                    const nameMatch  = chunk.match(/class="lPzHi"[^>]*>([^<]+)</);
-                    const descMatch  = chunk.match(/class="okI98"[^>]*>([^<]+)</);
-                    const priceMatch = chunk.match(/class="p2H02"[^>]*>([^<]+)</);
-                    const imgMatch   =
-                      chunk.match(/(?:src|data-src)="(https?:\/\/[^"]*pstatic\.net[^"]*)"/) ||
-                      chunk.match(/"(https:\\u002F\\u002F[^"]*pstatic[^"\\]+)"/);
-                    const imageUrl = imgMatch ? imgMatch[1].replace(/\\u002F/g,'/').replace(/\\u0026/g,'&') : '';
-                    if (i < 3) console.log(`[HTML] chunk[${i}] name=${nameMatch?.[1]} img=${imageUrl.slice(0,60)}`);
-                    return { name: nameMatch?.[1]?.trim()||'', description: descMatch?.[1]?.trim()||'', price: priceMatch?.[1]?.trim()||'', imageUrl };
-                  }).filter(item => item.name || item.imageUrl);
-                }
-              }
-
-              console.log(`[Scrape 완료] 메뉴 ${menuItems.length}개\n`);
+              console.log(`[Scrape 완료] ${menuItems.length}개\n`);
               const images = menuItems.map(i => i.imageUrl).filter(Boolean);
               res.setHeader('Content-Type', 'application/json');
               return res.end(JSON.stringify({ menuItems, images, count: images.length, targetUrl }));

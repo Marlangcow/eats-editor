@@ -9,7 +9,7 @@ import {
 import { initializeApp, getApps } from 'firebase/app';
 import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
 import { getFirestore, collection, addDoc, onSnapshot } from 'firebase/firestore';
-import { getStorage, ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { getStorage, ref, uploadBytes, getDownloadURL, listAll } from 'firebase/storage';
 
 /**
  * [환경 설정 안전 로직]
@@ -153,29 +153,53 @@ const App = () => {
   // 2. 라이브러리 실시간 동기화
   useEffect(() => {
     if (!user || !db) return;
+    const storagePath = `artifacts/${currentAppId}/public/data/dummy_images`;
     const dummyRef = collection(db, 'artifacts', currentAppId, 'public', 'data', 'dummy_images');
+
+    const loadFromStorage = async () => {
+      if (!storage) return;
+      try {
+        const storageRef = ref(storage, storagePath);
+        const result = await listAll(storageRef);
+        const items = await Promise.all(result.items.map(async (itemRef) => {
+          const url = await getDownloadURL(itemRef);
+          // 타임스탬프 prefix 제거 후 확장자 제거
+          const rawName = itemRef.name.replace(/^\d+_/, '');
+          const name = rawName.split('.')[0].normalize('NFC');
+          return { id: itemRef.name, name, url, createdAt: '' };
+        }));
+        setLibrary(items);
+      } catch (e) {
+        console.error('Storage listAll 실패:', e);
+      }
+    };
+
     const unsubscribe = onSnapshot(dummyRef, (snapshot) => {
-      const items = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      items.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-      setLibrary(items);
+      if (snapshot.empty) {
+        // Firestore에 문서 없으면 Storage 직접 조회
+        loadFromStorage();
+      } else {
+        const items = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        items.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+        setLibrary(items);
+      }
     }, (error) => {
       console.error("Firestore Load Error:", error);
-      addToast('데이터 로드에 실패했습니다.', 'error');
+      loadFromStorage(); // Firestore 오류 시도 Storage fallback
     });
     return () => unsubscribe();
   }, [user]);
 
-  // 3. 검색 기능 — 파일명에 검색어가 포함된 이미지만 노출
+  // 3. 검색 기능 — 일치하는 항목 상단, 나머지 전체 노출
   useEffect(() => {
     if (searchQuery.trim() === '') {
       setRecommendedImages([]);
       return;
     }
-    const normalizedQuery = searchQuery.trim().toLowerCase().normalize('NFC');
-    const filtered = library.filter(item =>
-      (item.name || '').toLowerCase().normalize('NFC').includes(normalizedQuery)
-    );
-    setRecommendedImages(filtered);
+    const q = searchQuery.trim().toLowerCase().normalize('NFC');
+    const matched = library.filter(item => (item.name || '').toLowerCase().normalize('NFC').includes(q));
+    const rest = library.filter(item => !(item.name || '').toLowerCase().normalize('NFC').includes(q));
+    setRecommendedImages([...matched, ...rest]);
   }, [searchQuery, library]);
 
   const handleNaverScrape = async () => {
@@ -516,11 +540,10 @@ const App = () => {
               <button
                 onClick={() => retoucherInputRef.current?.click()}
                 disabled={isUploading}
-                className={`px-10 py-5 rounded-[1.5rem] font-black flex items-center gap-3 mx-auto transition-all shadow-xl active:scale-95 ${
-                  isUploading ? 'bg-slate-100 text-slate-400 cursor-not-allowed' :
+                className={`px-10 py-5 rounded-[1.5rem] font-black flex items-center gap-3 mx-auto transition-all shadow-xl active:scale-95 ${isUploading ? 'bg-slate-100 text-slate-400 cursor-not-allowed' :
                   uploadComplete ? 'bg-[#03C75A] text-white scale-105' :
-                  'bg-slate-900 text-white hover:bg-black hover:scale-105'
-                }`}
+                    'bg-slate-900 text-white hover:bg-black hover:scale-105'
+                  }`}
               >
                 {isUploading ? (
                   <><RefreshCw className="animate-spin" size={24} /> 업로드 중...</>
@@ -602,7 +625,7 @@ const App = () => {
                         </div>
                       </button>
                     ))}
-                    {searchQuery && recommendedImages.length === 0 && (
+                    {searchQuery && library.length === 0 && (
                       <p className="col-span-2 py-8 text-center text-slate-400 text-xs font-bold">라이브러리에 등록된 사진이 없어요.</p>
                     )}
                   </div>
